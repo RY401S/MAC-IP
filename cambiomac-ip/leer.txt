@@ -1,0 +1,11 @@
+ejemplo de lo que hace :
+
+sudo ip link set wlan0 down # desactiva la interfaz
+sudo macchanger -r wlan0   # cambia la mac aleatoriamente
+sudo ip link set wlan0 up  # actica la interfaz
+sudo dhclient -r wlan0    # libera IP vieja
+sudo dhclient wlan0       # solicita nueva IP para la nueva MAC
+
+Si no tienes instalado dhclient, instalalo con :
+sudo apt install isc-dhcp-client
+
