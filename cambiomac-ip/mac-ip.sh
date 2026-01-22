@@ -1,128 +1,222 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Valores
+########################
+# Variables por defecto
+########################
 IFACE="wlan0"
 MANUAL_MAC=""
 MANUAL_IP=""
 GATEWAY=""
-USE_DHCP=false
+MODE=""
+DHCP_TIMEOUT=15
 
-# Muestra ayuda
-usage() {
-  echo "Uso: $0 [-i interfaz] [-m nueva_mac] [--dhcp] [-a ip/máscara] [-g gateway]"
-  echo ""
-  echo "  -i INTERFAZ     Interfaz de red Wi-Fi (por defecto: wlan0)"
-  echo "  -m NUEVA_MAC    Dirección MAC personalizada (ej: 12:34:56:78:9A:BC)"
-  echo "  --dhcp          Forzar renovación de IP por DHCP"
-  echo "  -a IP/MÁSCARA   Asignar IP manual (ej: 192.168.1.100/24)"
-  echo "  -g GATEWAY      Establecer puerta de enlace (solo si usas -a)"
-  echo ""
-  echo "Ejemplos:"
-  echo "  $0 -i wlan0 --dhcp                     # MAC aleatoria y renovar IP por DHCP"
-  echo "  $0 -i wlan1 -m 12:34:56:78:9A:BC       # MAC fija, IP automática"
-  echo "  $0 -i wlan0 -a 192.168.1.50/24 -g 192.168.1.1  # MAC aleatoria, IP fija"
-  echo ""
-  exit 1
+########################
+# Funciones
+########################
+check_deps() {
+  local missing=()
+
+  for cmd in ip macchanger timeout awk; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+
+  if [[ "$MODE" == "RANDOM_IP" || "$MODE" == "RANDOM_ALL" ]] && ! command -v dhclient >/dev/null 2>&1; then
+    missing+=("dhclient")
+  fi
+
+  if [[ ${#missing[@]} -ne 0 ]]; then
+    echo "[!] Faltan dependencias necesarias:"
+    for m in "${missing[@]}"; do
+      echo "    - $m"
+    done
+    echo
+    echo "Instálalas manualmente:"
+    echo "    sudo apt install iproute2 macchanger isc-dhcp-client coreutils gawk"
+    echo
+    echo "    Arch Linux:"
+    echo "    sudo pacman -S iproute2 macchanger dhclient coreutils gawk"
+    exit 1
+  fi
 }
 
-# Parsear argumentos
-while [[ "$#" -gt 0 ]]; do
+die() { echo "[!] $1" >&2; exit 1; }
+info() { echo "[+] $1"; }
+
+detect_gateway() {
+  ip route show default 2>/dev/null | \
+    awk -v iface="$IFACE" '$1=="default" && $0~iface {print $3; exit}'
+}
+
+show_status() {
+  local mac ip gw method
+
+  mac=$(ip link show "$IFACE" | awk '/link\/ether/ {print $2}')
+  ip=$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}')
+  gw=$(ip route show default | awk -v iface="$IFACE" '$0 ~ iface {print $3}')
+  
+  if ip -4 addr show "$IFACE" | grep -q dynamic; then
+    method="DHCP"
+  elif [[ -n "$ip" ]]; then
+    method="Estática"
+  else
+    method="Sin IP"
+  fi
+
+  echo "=============================="
+  echo " Estado de la interfaz: $IFACE"
+  echo "=============================="
+  printf " Interfaz : %s\n" "$IFACE"
+  printf " MAC       : %s\n" "${mac:-N/A}"
+  printf " IP        : %s\n" "${ip:-No asignada}"
+  printf " Gateway   : %s\n" "${gw:-No definido}"
+  printf " Método IP : %s\n" "$method"
+  echo "=============================="
+  exit 0
+}
+
+
+usage() {
+cat <<EOF
+
+Uso: sudo $0 [modo] [opciones]
+
+MODOS DISPONIBLES:
+  -s,  --status
+  -rm, --random-mac
+  -ri, --random-ip
+  -ra, --random-all
+  -fa, --fixed-all
+
+OPCIONES:
+  -i IFACE
+  -m MAC
+  -a IP/MASK
+  -g GATEWAY
+  -h, --help
+  
+EJEMPLOS: 
+    sudo $0 -s 
+    sudo $0 -rm
+    sudo $0 -ri 
+    sudo $0 -ra 
+    sudo $0 -fa -m 12:34:56:78:9A:BC -a 192.168.1.105/24
+EOF
+exit 0
+}
+
+########################
+# Ayuda si no hay args
+########################
+[[ $# -eq 0 ]] && usage
+
+########################
+# Root
+########################
+[[ $EUID -eq 0 ]] || die "Ejecuta como root."
+
+########################
+# Parseo
+########################
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    -i)
-      IFACE="$2"
-      shift 2
-      ;;
-    -m)
-      MANUAL_MAC="$2"
-      shift 2
-      ;;
-    -a)
-      MANUAL_IP="$2"
-      shift 2
-      ;;
-    -g)
-      GATEWAY="$2"
-      shift 2
-      ;;
-    --dhcp)
-      USE_DHCP=true
-      shift
-      ;;
-    -h|--help)
-      usage
-      ;;
-    *)
-      echo "[!] Opción desconocida: $1"
-      usage
-      ;;
+    -i) IFACE="$2"; shift 2 ;;
+    -m) MANUAL_MAC="$2"; shift 2 ;;
+    -a) MANUAL_IP="$2"; shift 2 ;;
+    -g) GATEWAY="$2"; shift 2 ;;
+    -s|--status) MODE="STATUS"; shift ;;
+    -rm|--random-mac) MODE="RANDOM_MAC"; shift ;;
+    -ri|--random-ip) MODE="RANDOM_IP"; shift ;;
+    -ra|--random-all) MODE="RANDOM_ALL"; shift ;;
+    -fa|--fixed-all) MODE="FIXED_ALL"; shift ;;
+    -h|--help) usage ;;
+    *) die "Opción desconocida: $1" ;;
   esac
 done
 
-echo "[+] Usando interfaz: $IFACE"
+check_deps
+[[ -z "$MODE" ]] && die "Debes especificar un modo"
 
-# Verifica si la interfaz existe
-if ! ip link show "$IFACE" > /dev/null 2>&1; then
-  echo "[!] Error: la interfaz '$IFACE' no existe."
-  exit 1
+########################
+# Validar interfaz
+########################
+ip link show "$IFACE" >/dev/null 2>&1 || die "Interfaz inválida: $IFACE"
+[[ "$IFACE" == "lo" ]] && die "No se permite loopback"
+
+if ! [[ "$IFACE" =~ ^(wl|en|eth) ]]; then
+  die "Interfaz no permitida: $IFACE"
 fi
 
-echo "[+] Apagando interfaz $IFACE..."
-sudo ip link set "$IFACE" down
+[[ "$MODE" == "STATUS" ]] && show_status
 
-if [[ -n "$MANUAL_MAC" ]]; then
-  echo "[+] Estableciendo MAC manual: $MANUAL_MAC"
-  sudo macchanger -m "$MANUAL_MAC" "$IFACE"
-else
-  echo "[+] Generando MAC aleatoria..."
-  sudo macchanger -r "$IFACE"
+########################
+# Validaciones
+########################
+if [[ -n "$MANUAL_MAC" && ! "$MANUAL_MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+  die "MAC inválida"
 fi
 
-echo "[+] Encendiendo interfaz $IFACE..."
-sudo ip link set "$IFACE" up
+if [[ -n "$MANUAL_IP" && ! "$MANUAL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  die "IP inválida"
+fi
 
-echo "[+] Configurando IP..."
+########################
+# Gateway automático
+########################
+if [[ -z "$GATEWAY" && "$MODE" == "FIXED_ALL" ]]; then
+  GATEWAY=$(detect_gateway || true)
+  [[ -n "$GATEWAY" ]] || die "No se pudo detectar gateway"
+  info "Gateway detectado automáticamente: $GATEWAY"
 
-if [[ "$USE_DHCP" = true ]]; then
-  echo "[+] Renovando IP vía DHCP... "
-  sudo dhclient -r "$IFACE" 2>/dev/null || true
-  sudo dhclient "$IFACE"
+  [[ "$GATEWAY" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Gateway inválido"
+fi
 
-elif [[ -n "$MANUAL_IP" ]]; then
-  echo "[+] Asignando IP manual: $MANUAL_IP"
-  sudo ip addr flush dev "$IFACE"
-  sudo ip addr add "$MANUAL_IP" dev "$IFACE"
+########################
+# Apagar interfaz
+########################
+info "Apagando $IFACE"
+ip link set "$IFACE" down
 
-  if [[ -n "$GATEWAY" ]]; then
-    echo "[+] Estableciendo gateway: $GATEWAY"
-    sudo ip route add default via "$GATEWAY"
-  fi
-
-else
-  echo "[+] Esperando a que se asigne una IP automáticamente :3"
-  MAX_WAIT=15
-  WAITED=0
-
-  while true; do
-    IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-    if [[ -n "$IP" ]]; then
-      echo "[+] IP asignada : $IP"
-      break
+########################
+# MAC
+########################
+case "$MODE" in
+  RANDOM_MAC|RANDOM_ALL|FIXED_ALL)
+    if [[ -n "$MANUAL_MAC" ]]; then
+      macchanger -m "$MANUAL_MAC" "$IFACE"
+    else
+      macchanger -r "$IFACE"
     fi
+    ;;
+esac
 
-    if [[ "$WAITED" -ge "$MAX_WAIT" ]]; then
-      echo "[!] Tiempo de espera agotado: no se asignó IP tras $MAX_WAIT segundos :( ."
-      break
-    fi
+########################
+# Subir interfaz
+########################
+ip link set "$IFACE" up
 
-    sleep 1
-    WAITED=$((WAITED + 1))
-  done
-fi
+########################
+# IP
+########################
+case "$MODE" in
+  RANDOM_IP|RANDOM_ALL)
+    info "Renovando IP por DHCP"
+    ip addr flush dev "$IFACE"        
+    dhclient -r "$IFACE" 2>/dev/null || true
+    timeout "$DHCP_TIMEOUT" dhclient "$IFACE" || die "DHCP falló"
+    ;;
+  FIXED_ALL)
+    ip addr flush dev "$IFACE"
+    ip addr add "$MANUAL_IP" dev "$IFACE"
+    ip route replace default via "$GATEWAY"
+    ;;
+esac
 
-echo ""
-echo "[+] Nueva configuración de $IFACE:"
+########################
+# Resultado
+########################
+echo
 ip a show "$IFACE" | grep -E "link/ether|inet "
-
-echo ""
-echo "[✓] Proceso completo."
-
+ip route show default | grep "$IFACE" || true
+echo
+info "Proceso completado ✔"
